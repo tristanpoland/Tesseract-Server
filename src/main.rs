@@ -265,69 +265,61 @@ impl BuildCluster {
     }
 
     async fn build_locally(&self, unit: BuildUnit, release: bool) -> Result<BuildResponse, Box<dyn std::error::Error>> {
-        let package_dir = self.build_dir.join(&unit.package_name);
+        let package_dir = self.build_dir.join(format!("{}_{}", unit.package_name, std::process::id()));
         
-        // Directory creation
-        if let Err(e) = tokio::fs::create_dir_all(&package_dir).await {
-            return Ok(BuildResponse::BuildError {
-                unit_name: unit.package_name.clone(),
-                error: format!("Failed to create build directory: {}", e),
-            });
-        }
+        let _ = tokio::fs::remove_dir_all(&package_dir).await;
+        tokio::fs::create_dir_all(&package_dir).await.map_err(|e| format!("Failed to create package dir: {}", e))?;
+        tokio::fs::create_dir_all(package_dir.join("src")).await.map_err(|e| format!("Failed to create src dir: {}", e))?;
     
-        // Create source tree 
-        let src_dir = package_dir.join("src");
-        if let Err(e) = tokio::fs::create_dir_all(&src_dir).await {
-            return Ok(BuildResponse::BuildError {
-                unit_name: unit.package_name.clone(),
-                error: format!("Failed to create src directory: {}", e),
-            });
-        }
-    
-        // Copy source files
-        for source_path in &unit.source_files {
-            let relative_path = source_path.strip_prefix("./").unwrap_or(source_path);
-            let target_path = if relative_path.file_name().map_or(false, |name| name == "Cargo.toml") {
-                package_dir.join(relative_path.file_name().unwrap())
-            } else {
-                package_dir.join(relative_path)
-            };
-    
-            if let Some(parent) = target_path.parent() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    return Ok(BuildResponse::BuildError {
-                        unit_name: unit.package_name.clone(),
-                        error: format!("Failed to create directory for {}: {}", relative_path.display(), e),
-                    });
-                }
-            }
-            
-            match tokio::fs::read(source_path).await {
-                Ok(content) => {
-                    if let Err(e) = tokio::fs::write(&target_path, content).await {
-                        return Ok(BuildResponse::BuildError {
-                            unit_name: unit.package_name.clone(),
-                            error: format!("Failed to write {}: {}", target_path.display(), e),
-                        });
-                    }
-                }
-                Err(e) => {
-                    return Ok(BuildResponse::BuildError {
-                        unit_name: unit.package_name.clone(),
-                        error: format!("Failed to read source file {}: {}", source_path.display(), e),
-                    });
-                }
+        // First, verify all files exist
+        for path in &unit.source_files {
+            if !path.exists() {
+                return Ok(BuildResponse::BuildError {
+                    unit_name: unit.package_name.clone(),
+                    error: format!("Source file not found: {}", path.display()),
+                });
             }
         }
     
-        // Run cargo build
-        let mut command = Command::new("cargo");
-        command
+        // Handle Cargo.toml
+        let mut found_cargo_toml = false;
+        for source_path in unit.source_files.iter().filter(|p| p.file_name().map_or(false, |name| name == "Cargo.toml")) {
+            let content = tokio::fs::read(source_path).await.map_err(|e| format!("Failed to read Cargo.toml: {}", e))?;
+            tokio::fs::write(package_dir.join("Cargo.toml"), content).await.map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
+            found_cargo_toml = true;
+        }
+    
+        if !found_cargo_toml {
+            return Ok(BuildResponse::BuildError {
+                unit_name: unit.package_name,
+                error: "Cargo.toml not found in source files".to_string(),
+            });
+        }
+    
+        // Handle Rust files
+        let mut found_rust_file = false;
+        for source_path in unit.source_files.iter().filter(|p| p.extension().map_or(false, |ext| ext == "rs")) {
+            let file_name = source_path.file_name().ok_or("Invalid source file path")?;
+            let target_path = package_dir.join("src").join(file_name);
+            let content = tokio::fs::read(source_path).await.map_err(|e| format!("Failed to read {}: {}", source_path.display(), e))?;
+            tokio::fs::write(&target_path, content).await.map_err(|e| format!("Failed to write {}: {}", target_path.display(), e))?;
+            found_rust_file = true;
+        }
+    
+        if !found_rust_file {
+            return Ok(BuildResponse::BuildError {
+                unit_name: unit.package_name,
+                error: "No Rust source files found".to_string(),
+            });
+        }
+    
+        info!("Building in directory: {}", package_dir.display());
+        let output = Command::new("cargo")
             .current_dir(&package_dir)
             .arg("build")
-            .args(if release { vec!["--release"] } else { vec![] });
-    
-        let output = command.output().map_err(|e| format!("Failed to execute cargo build: {}", e))?;
+            .args(if release { vec!["--release"] } else { vec![] })
+            .output()
+            .map_err(|e| format!("Failed to execute cargo build: {}", e))?;
     
         if !output.status.success() {
             return Ok(BuildResponse::BuildError {
@@ -336,24 +328,20 @@ impl BuildCluster {
             });
         }
     
-        // Collect artifacts
         let mut artifacts = Vec::new();
         let target_dir = package_dir.join("target").join(if release { "release" } else { "debug" });
         
         for artifact_path in &unit.artifacts {
             let file_path = target_dir.join(artifact_path);
-            match tokio::fs::read(&file_path).await {
-                Ok(data) => artifacts.push((artifact_path.clone(), data)),
-                Err(e) => {
-                    return Ok(BuildResponse::BuildError {
-                        unit_name: unit.package_name,
-                        error: format!("Failed to read artifact {}: {}", file_path.display(), e),
-                    });
-                }
-            }
+            let data = tokio::fs::read(&file_path).await
+                .map_err(|e| format!("Failed to read artifact {}: {}", file_path.display(), e))?;
+            artifacts.push((artifact_path.clone(), data));
         }
     
-        // Return success
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_dir_all(&package_dir).await;
+        });
+    
         Ok(BuildResponse::BuildComplete {
             unit_name: unit.package_name,
             artifacts,
