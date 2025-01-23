@@ -277,6 +277,13 @@ impl BuildCluster {
     
         // Source file copy errors
         for source_path in &unit.source_files {
+            if !source_path.exists() {
+                return Ok(BuildResponse::BuildError {
+                    unit_name: unit.package_name.clone(),
+                    error: format!("Source file not found: {}", source_path.display()),
+                });
+            }
+    
             let target_path = package_dir.join(source_path);
             if let Some(parent) = target_path.parent() {
                 if let Err(e) = tokio::fs::create_dir_all(parent).await {
