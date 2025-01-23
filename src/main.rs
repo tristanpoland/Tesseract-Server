@@ -266,45 +266,81 @@ impl BuildCluster {
 
     async fn build_locally(&self, unit: BuildUnit, release: bool) -> Result<BuildResponse, Box<dyn std::error::Error>> {
         let package_dir = self.build_dir.join(&unit.package_name);
-        tokio::fs::create_dir_all(&package_dir).await?;
-
+        
+        // Directory creation error
+        if let Err(e) = tokio::fs::create_dir_all(&package_dir).await {
+            return Ok(BuildResponse::BuildError {
+                unit_name: unit.package_name.clone(),
+                error: format!("Failed to create build directory: {}", e),
+            });
+        }
+    
+        // Source file copy errors
         for source_path in &unit.source_files {
             let target_path = package_dir.join(source_path);
             if let Some(parent) = target_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    return Ok(BuildResponse::BuildError {
+                        unit_name: unit.package_name.clone(),
+                        error: format!("Failed to create directory for {}: {}", source_path.display(), e),
+                    });
+                }
             }
-            if let Ok(content) = tokio::fs::read(source_path).await {
-                tokio::fs::write(&target_path, content).await?;
+            
+            match tokio::fs::read(source_path).await {
+                Ok(content) => {
+                    if let Err(e) = tokio::fs::write(&target_path, content).await {
+                        return Ok(BuildResponse::BuildError {
+                            unit_name: unit.package_name.clone(),
+                            error: format!("Failed to write {}: {}", target_path.display(), e),
+                        });
+                    }
+                }
+                Err(e) => {
+                    return Ok(BuildResponse::BuildError {
+                        unit_name: unit.package_name.clone(),
+                        error: format!("Failed to read source file {}: {}", source_path.display(), e),
+                    });
+                }
             }
         }
-
-        let status = Command::new("cargo")
+    
+        // Cargo build errors
+        let output = Command::new("cargo")
             .current_dir(&package_dir)
             .arg("build")
             .args(if release { vec!["--release"] } else { vec![] })
-            .status()?;
-
-        if status.success() {
-            let mut artifacts = Vec::new();
-            let target_dir = package_dir.join("target").join(if release { "release" } else { "debug" });
-            
-            for artifact_path in &unit.artifacts {
-                let file_path = target_dir.join(artifact_path);
-                if let Ok(data) = tokio::fs::read(&file_path).await {
-                    artifacts.push((artifact_path.clone(), data));
+            .output()
+            .map_err(|e| format!("Failed to execute cargo build: {}", e))?;
+    
+        if !output.status.success() {
+            return Ok(BuildResponse::BuildError {
+                unit_name: unit.package_name,
+                error: String::from_utf8_lossy(&output.stderr).to_string(),
+            });
+        }
+    
+        // Artifact collection errors
+        let mut artifacts = Vec::new();
+        let target_dir = package_dir.join("target").join(if release { "release" } else { "debug" });
+        
+        for artifact_path in &unit.artifacts {
+            let file_path = target_dir.join(artifact_path);
+            match tokio::fs::read(&file_path).await {
+                Ok(data) => artifacts.push((artifact_path.clone(), data)),
+                Err(e) => {
+                    return Ok(BuildResponse::BuildError {
+                        unit_name: unit.package_name,
+                        error: format!("Failed to read artifact {}: {}", file_path.display(), e),
+                    });
                 }
             }
-
-            Ok(BuildResponse::BuildComplete {
-                unit_name: unit.package_name,
-                artifacts,
-            })
-        } else {
-            Ok(BuildResponse::BuildError {
-                unit_name: unit.package_name,
-                error: "Build failed".to_string(),
-            })
         }
+    
+        Ok(BuildResponse::BuildComplete {
+            unit_name: unit.package_name,
+            artifacts,
+        })
     }
 }
 
