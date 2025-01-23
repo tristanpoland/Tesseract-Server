@@ -275,21 +275,24 @@ impl BuildCluster {
             });
         }
     
+        // Create src directory structure
+        if let Err(e) = tokio::fs::create_dir_all(package_dir.join("src")).await {
+            return Ok(BuildResponse::BuildError {
+                unit_name: unit.package_name.clone(),
+                error: format!("Failed to create src directory: {}", e),
+            });
+        }
+    
         // Source file copy errors
         for source_path in &unit.source_files {
-            if !source_path.exists() {
-                return Ok(BuildResponse::BuildError {
-                    unit_name: unit.package_name.clone(),
-                    error: format!("Source file not found: {}", source_path.display()),
-                });
-            }
+            let relative_path = source_path.strip_prefix("./").unwrap_or(source_path);
+            let target_path = package_dir.join(relative_path);
     
-            let target_path = package_dir.join(source_path);
             if let Some(parent) = target_path.parent() {
                 if let Err(e) = tokio::fs::create_dir_all(parent).await {
                     return Ok(BuildResponse::BuildError {
                         unit_name: unit.package_name.clone(),
-                        error: format!("Failed to create directory for {}: {}", source_path.display(), e),
+                        error: format!("Failed to create directory for {}: {}", relative_path.display(), e),
                     });
                 }
             }
@@ -310,6 +313,22 @@ impl BuildCluster {
                     });
                 }
             }
+        }
+    
+        // Copy Cargo.toml
+        let cargo_toml = std::env::current_dir()?.join("Cargo.toml");
+        if let Ok(content) = tokio::fs::read(&cargo_toml).await {
+            if let Err(e) = tokio::fs::write(package_dir.join("Cargo.toml"), content).await {
+                return Ok(BuildResponse::BuildError {
+                    unit_name: unit.package_name.clone(),
+                    error: format!("Failed to copy Cargo.toml: {}", e),
+                });
+            }
+        } else {
+            return Ok(BuildResponse::BuildError {
+                unit_name: unit.package_name.clone(),
+                error: "Failed to read Cargo.toml".to_string(),
+            });
         }
     
         // Cargo build errors
