@@ -55,4 +55,4 @@ ARG UID=10001
 COPY --from=build /bin/server /bin/
 
 # What the container should run when it is started.
-CMD ["sudo", "/bin/server"]
+CMD ["/bin/server"]
