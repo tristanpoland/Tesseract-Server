@@ -17,7 +17,7 @@ use tracing::{info, warn, error};
 use futures::future::join_all;
 use walkdir::WalkDir;
 
-const BUFFER_SIZE: usize = 1024 * 1024 * 10; // 10MB buffer for large builds
+const BUFFER_SIZE: usize = 1024 * 1024 * 10;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -93,17 +93,23 @@ impl BuildCluster {
             
             let msg = BuildRequest::Heartbeat;
             let data = bincode::serialize(&msg)?;
+            let len = (data.len() as u32).to_be_bytes();
+            stream.write_all(&len).await?;
             stream.write_all(&data).await?;
 
-            let mut buf = vec![0; BUFFER_SIZE];
-            let n = stream.read(&mut buf).await?;
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf);
             
-            if let Ok(BuildResponse::HeartbeatAck) = bincode::deserialize(&buf[..n]) {
+            let mut buf = vec![0; len as usize];
+            stream.read_exact(&mut buf).await?;
+            
+            if let Ok(BuildResponse::HeartbeatAck) = bincode::deserialize(&buf) {
                 let mut nodes = self.nodes.write().await;
                 nodes.insert(Node {
                     host: seed.split(':').next().unwrap().to_string(),
                     port: seed.split(':').nth(1).unwrap().parse()?,
-                    cores: 0, // Will be updated with heartbeat
+                    cores: 0,
                 }, tokio::time::Instant::now().elapsed());
             }
         }
@@ -121,17 +127,17 @@ impl BuildCluster {
                 let current_time = tokio::time::Instant::now();
                 let mut nodes = nodes.write().await;
                 
-                // Remove stale nodes
                 nodes.retain(|_, last_seen| 
                     current_time.elapsed() - *last_seen < CONNECTION_TIMEOUT
                 );
 
-                // Send heartbeat to all nodes
                 for (node, _) in nodes.clone() {
                     if node != local_node {
                         if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", node.host, node.port)).await {
                             let msg = BuildRequest::Heartbeat;
                             if let Ok(data) = bincode::serialize(&msg) {
+                                let len = (data.len() as u32).to_be_bytes();
+                                let _ = stream.write_all(&len).await;
                                 let _ = stream.write_all(&data).await;
                             }
                         }
@@ -152,7 +158,6 @@ impl BuildCluster {
         let mut graph = Graph::<BuildUnit, (), Directed>::new();
         let mut pkg_to_node = HashMap::new();
 
-        // Create build units
         for package in &metadata.packages {
             let source_files = package.targets.iter()
                 .filter(|t| t.kind.iter().any(|k| k == "lib" || k == "bin"))
@@ -180,7 +185,6 @@ impl BuildCluster {
             pkg_to_node.insert(package.name.clone(), idx);
         }
 
-        // Add dependency edges
         for package in &metadata.packages {
             let from = pkg_to_node[&package.name];
             for dep in &package.dependencies {
@@ -197,7 +201,6 @@ impl BuildCluster {
         let nodes = self.nodes.read().await;
         let mut node_iter = nodes.keys().cycle();
 
-        // Start builds in dependency order
         for unit_idx in build_order {
             let unit = graph[unit_idx].clone();
             if let Some(node) = node_iter.next() {
@@ -210,7 +213,6 @@ impl BuildCluster {
             }
         }
 
-        // Wait for all builds
         let results = join_all(futures).await;
         for result in results {
             match result {
@@ -247,11 +249,17 @@ impl BuildCluster {
 
         let req = BuildRequest::BuildUnit { unit, release };
         let data = bincode::serialize(&req)?;
+        let len = (data.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
         stream.write_all(&data).await?;
 
-        let mut buf = vec![0; BUFFER_SIZE];
-        let n = stream.read(&mut buf).await?;
-        let resp: BuildResponse = bincode::deserialize(&buf[..n])?;
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf);
+        
+        let mut buf = vec![0; len as usize];
+        stream.read_exact(&mut buf).await?;
+        let resp: BuildResponse = bincode::deserialize(&buf)?;
 
         Ok(resp)
     }
@@ -260,7 +268,6 @@ impl BuildCluster {
         let package_dir = self.build_dir.join(&unit.package_name);
         tokio::fs::create_dir_all(&package_dir).await?;
 
-        // Write source files
         for source_path in &unit.source_files {
             let target_path = package_dir.join(source_path);
             if let Some(parent) = target_path.parent() {
@@ -271,7 +278,6 @@ impl BuildCluster {
             }
         }
 
-        // Build
         let status = Command::new("cargo")
             .current_dir(&package_dir)
             .arg("build")
@@ -279,7 +285,6 @@ impl BuildCluster {
             .status()?;
 
         if status.success() {
-            // Collect artifacts
             let mut artifacts = Vec::new();
             let target_dir = package_dir.join("target").join(if release { "release" } else { "debug" });
             
@@ -307,14 +312,12 @@ async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) {
     socket.set_nodelay(true).unwrap();
     
     loop {
-        // Read message length
         let mut len_buf = [0u8; 4];
         if socket.read_exact(&mut len_buf).await.is_err() {
             break;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         
-        // Read exact message
         let mut buf = vec![0; len];
         if socket.read_exact(&mut buf).await.is_err() {
             break;
@@ -351,6 +354,8 @@ async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) {
             };
 
             if let Ok(response_data) = bincode::serialize(&response) {
+                let len = (response_data.len() as u32).to_be_bytes();
+                let _ = socket.write_all(&len).await;
                 let _ = socket.write_all(&response_data).await;
             }
         }
