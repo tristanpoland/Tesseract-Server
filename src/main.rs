@@ -17,7 +17,11 @@ use std::{
 };
 use tar::Archive;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::{mpsc, RwLock}, time
+    io::{AsyncReadExt, AsyncWriteExt}, 
+    net::{TcpListener, TcpStream}, 
+    sync::{mpsc, RwLock}, 
+    time,
+    process::Command as TokioCommand,
 };
 use tracing::{error, info, warn, debug, instrument, Level};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -65,7 +69,8 @@ struct BuildUnit {
 enum BuildRequest {
     BuildUnit { 
         unit: BuildUnit, 
-        release: bool, 
+        release: bool,
+        target: Option<String>,
         tarball_data: Vec<u8> 
     },
     TransferArtifact {
@@ -122,6 +127,30 @@ impl BuildCluster {
         }
     }
 
+    async fn ensure_target_installed(target: &str) -> Result<()> {
+        // Check if target is already installed
+        let output = TokioCommand::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()
+            .await?;
+
+        let installed_targets = String::from_utf8_lossy(&output.stdout);
+        if !installed_targets.lines().any(|line| line.trim() == target) {
+            // Install the target
+            info!("Installing target {}", target);
+            let install_output = TokioCommand::new("rustup")
+                .args(["target", "add", target])
+                .output()
+                .await?;
+
+            if !install_output.status.success() {
+                let error = String::from_utf8_lossy(&install_output.stderr);
+                return Err(anyhow::anyhow!("Failed to install target {}: {}", target, error));
+            }
+        }
+        Ok(())
+    }
+
     fn get_gitignore_patterns() -> Vec<String> {
         let mut patterns = vec![
             ".git".to_string(),
@@ -173,12 +202,10 @@ impl BuildCluster {
                 let relative_path = source_path.strip_prefix(source_path.parent().unwrap())?;
                 let dest_path = temp_path.join(relative_path);
                 
-                // Create parent directories 
                 if let Some(parent) = dest_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 
-                // Avoid duplicate files
                 if !added_files.contains(&dest_path) {
                     std::fs::copy(source_path, &dest_path)?;
                     added_files.insert(dest_path);
@@ -186,7 +213,6 @@ impl BuildCluster {
             }
         }
         
-        // Create gzipped tarball
         let mut tarball = Vec::new();
         {
             let encoder = GzEncoder::new(&mut tarball, Compression::default());
@@ -213,8 +239,19 @@ impl BuildCluster {
         &self, 
         unit: BuildUnit, 
         release: bool,
+        target: Option<String>,
         tarball_data: Vec<u8>
     ) -> Result<BuildResponse> {
+        // Install target if specified
+        if let Some(target_triple) = &target {
+            if let Err(e) = Self::ensure_target_installed(target_triple).await {
+                return Ok(BuildResponse::BuildError {
+                    unit_name: unit.package_name.clone(),
+                    error: format!("Failed to install target {}: {}", target_triple, e),
+                });
+            }
+        }
+
         let package_dir = self.build_dir.join(format!("{}_{}", unit.package_name, std::process::id()));
         
         // Clean up previous builds
@@ -235,11 +272,18 @@ impl BuildCluster {
         }
 
         // Prepare build command
-        let build_type = if release { "release" } else { "debug" };
-        let output = tokio::process::Command::new("cargo")
-            .current_dir(&package_dir)
+        let mut cmd = TokioCommand::new("cargo");
+        cmd.current_dir(&package_dir)
             .arg("build")
-            .args(if release { vec!["--release"] } else { vec![] })
+            .args(if release { vec!["--release"] } else { vec![] });
+
+        // Add target if specified
+        if let Some(target_triple) = &target {
+            cmd.args(["--target", target_triple]);
+        }
+
+        // Execute build
+        let output = cmd
             .output()
             .await
             .context("Failed to execute cargo build")?;
@@ -256,14 +300,30 @@ impl BuildCluster {
     
         // Collect artifacts
         let mut artifacts = Vec::new();
-        let target_dir = package_dir.join("target").join(build_type);
+        let mut target_dir = package_dir.join("target");
+        if let Some(target_triple) = &target {
+            target_dir = target_dir.join(target_triple);
+        }
+        target_dir = target_dir.join(if release { "release" } else { "debug" });
         
         for artifact_path in &unit.artifacts {
             let file_path = target_dir.join(artifact_path);
-            let data = tokio::fs::read(&file_path)
-                .await
-                .context(format!("Failed to read artifact {}", file_path.display()))?;
-            artifacts.push((artifact_path.clone(), data));
+            match tokio::fs::read(&file_path).await {
+                Ok(data) => {
+                    artifacts.push((artifact_path.clone(), data));
+                }
+                Err(e) => {
+                    error!(
+                        unit_name = %unit.package_name,
+                        artifact = %file_path.display(),
+                        "Failed to read artifact: {}", e
+                    );
+                    return Ok(BuildResponse::BuildError {
+                        unit_name: unit.package_name,
+                        error: format!("Failed to read artifact {}: {}", file_path.display(), e),
+                    });
+                }
+            }
         }
     
         // Background cleanup
@@ -303,11 +363,10 @@ impl BuildCluster {
             let tx_clone = tx.clone();
             async move {
                 loop {
-                    let current_time = time::Instant::now();
-                    let mut nodes = nodes.write().await;
+                    let nodes = nodes.read().await;
                     
-                    for (node, _) in nodes.clone().iter() {
-                        if *node != local_node {
+                    for (node, _) in nodes.iter() {
+                        if node != &local_node {
                             match TcpStream::connect(format!("{}:{}", node.host, node.port)).await {
                                 Ok(mut stream) => {
                                     let msg = BuildRequest::Heartbeat;
@@ -329,6 +388,160 @@ impl BuildCluster {
                 }
             }
         });
+
+        Ok(())
+    }
+
+    async fn build_on_node(&self, node: &Node, unit: BuildUnit, release: bool, target: Option<String>) -> Result<BuildResponse> {
+        let mut stream = TcpStream::connect(format!("{}:{}", node.host, node.port)).await?;
+        stream.set_nodelay(true)?;
+        
+        let tarball_data = Self::create_tarball(&unit)?;
+        let request = BuildRequest::BuildUnit { 
+            unit, 
+            release, 
+            target,
+            tarball_data 
+        };
+        let data = bincode::serialize(&request)?;
+        
+        let len = (data.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&data).await?;
+        
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await;
+        let len = u32::from_be_bytes(len_buf);
+        
+        let mut buf = vec![0; len as usize];
+        stream.read_exact(&mut buf).await?;
+        
+        Ok(bincode::deserialize(&buf)?)
+    }
+
+    async fn join_cluster(&self, seed: &str) -> Result<()> {
+        let mut stream = TcpStream::connect(seed).await?;
+        stream.set_nodelay(true)?;
+        
+        // Send heartbeat to seed node
+        let msg = BuildRequest::Heartbeat;
+        let data = bincode::serialize(&msg)?;
+        let len = (data.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&data).await?;
+
+        // Read response
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf);
+        
+        let mut buf = vec![0; len as usize];
+        stream.read_exact(&mut buf).await?;
+        
+        // Process seed node response
+        match bincode::deserialize(&buf)? {
+            BuildResponse::HeartbeatAck => {
+                let mut nodes = self.nodes.write().await;
+                nodes.insert(Node {
+                    host: seed.split(':').next().unwrap().to_string(),
+                    port: seed.split(':').nth(1).unwrap().parse()?,
+                    cores: 0,
+                }, time::Instant::now());
+                Ok(())
+            },
+            _ => Err(anyhow::anyhow!("Invalid response from seed node"))
+        }
+    }
+
+    async fn distribute_build(&self, workspace_path: PathBuf, release: bool, target: Option<String>) -> Result<()> {
+        // Retrieve project metadata
+        let metadata = MetadataCommand::new()
+            .current_dir(&workspace_path)
+            .exec()?;
+
+        // Create dependency graph
+        let mut graph = Graph::<BuildUnit, (), Directed>::new();
+        let mut pkg_to_node = HashMap::new();
+
+        // Build graph of build units
+        for package in &metadata.packages {
+            let source_files: Vec<PathBuf> = package.targets.iter()
+                .filter(|t| t.kind.iter().any(|k| k == "lib" || k == "bin"))
+                .flat_map(|t| {
+                    WalkDir::new(t.src_path.parent().unwrap())
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+                        .map(|e| e.path().to_path_buf())
+                })
+                .collect();
+
+            let unit = BuildUnit {
+                package_name: package.name.clone(),
+                dependencies: package.dependencies.iter()
+                    .map(|d| d.name.clone())
+                    .collect(),
+                source_files,
+                artifacts: package.targets.iter()
+                    .map(|t: &cargo_metadata::Target| PathBuf::from(&t.name))
+                    .collect(),
+            };
+
+            let idx = graph.add_node(unit);
+            pkg_to_node.insert(package.name.clone(), idx);
+        }
+
+        // Add dependency edges
+        for package in &metadata.packages {
+            let from = pkg_to_node[&package.name];
+            for dep in &package.dependencies {
+                if let Some(&to) = pkg_to_node.get(&dep.name) {
+                    graph.add_edge(from, to, ());
+                }
+            }
+        }
+
+        // Determine build order
+        let build_order = petgraph::algo::toposort(&graph, None)
+            .map_err(|_| anyhow::anyhow!("Cyclic dependencies detected"))?;
+
+        // Prepare build futures
+        let mut futures = Vec::new();
+        let nodes = self.nodes.read().await;
+        let mut node_iter = nodes.keys().cycle();
+
+        // Schedule builds across nodes
+        for unit_idx in build_order {
+            let unit = graph[unit_idx].clone();
+            if let Some(node) = node_iter.next() {
+                let node = node.clone();
+                let self_ref = self.clone();
+                let target = target.clone();
+                let build_future = async move {
+                    self_ref.build_on_node(&node, unit, release, target).await
+                };
+                futures.push(build_future);
+            }
+        }
+
+        // Execute builds and process results
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(BuildResponse::BuildComplete { unit_name, artifacts }) => {
+                    info!(unit = %unit_name, "Build complete");
+                    let mut cache = self.build_cache.write().await;
+                    for (path, data) in artifacts {
+                        cache.insert(format!("{}:{}", unit_name, path.display()), data);
+                    }
+                }
+                Ok(BuildResponse::BuildError { unit_name, error }) => {
+                    error!(unit = %unit_name, "Build failed: {}", error);
+                    return Err(anyhow::anyhow!("Build failed for {}: {}", unit_name, error));
+                }
+                _ => {}
+            }
+        }
 
         Ok(())
     }
@@ -357,8 +570,8 @@ async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) ->
         };
 
         let response = match request {
-            BuildRequest::BuildUnit { unit, release, tarball_data } => {
-                match cluster.build_locally_with_tarball(unit, release, tarball_data).await {
+            BuildRequest::BuildUnit { unit, release, target, tarball_data } => {
+                match cluster.build_locally_with_tarball(unit, release, target, tarball_data).await {
                     Ok(resp) => resp,
                     Err(e) => BuildResponse::BuildError {
                         unit_name: "unknown".to_string(),
@@ -451,157 +664,5 @@ async fn main() -> Result<()> {
                 error!(error = %e, "Failed to accept connection");
             }
         }
-    }
-
-    Ok(())
-}
-
-impl BuildCluster {
-    async fn build_on_node(&self, node: &Node, unit: BuildUnit, release: bool) -> Result<BuildResponse> {
-        let mut stream = TcpStream::connect(format!("{}:{}", node.host, node.port)).await?;
-        stream.set_nodelay(true)?;
-        
-        let tarball_data = Self::create_tarball(&unit)?;
-        let request = BuildRequest::BuildUnit { unit, release, tarball_data };
-        let data = bincode::serialize(&request)?;
-        
-        let len = (data.len() as u32).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&data).await?;
-        
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf);
-        
-        let mut buf = vec![0; len as usize];
-        stream.read_exact(&mut buf).await?;
-        
-        Ok(bincode::deserialize(&buf)?)
-    }
-
-    async fn join_cluster(&self, seed: &str) -> Result<()> {
-        let mut stream = TcpStream::connect(seed).await?;
-        stream.set_nodelay(true)?;
-        
-        // Send heartbeat to seed node
-        let msg = BuildRequest::Heartbeat;
-        let data = bincode::serialize(&msg)?;
-        let len = (data.len() as u32).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&data).await?;
-
-        // Read response
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf);
-        
-        let mut buf = vec![0; len as usize];
-        stream.read_exact(&mut buf).await?;
-        
-        // Process seed node response
-        match bincode::deserialize(&buf)? {
-            BuildResponse::HeartbeatAck => {
-                let mut nodes = self.nodes.write().await;
-                nodes.insert(Node {
-                    host: seed.split(':').next().unwrap().to_string(),
-                    port: seed.split(':').nth(1).unwrap().parse()?,
-                    cores: 0,
-                }, time::Instant::now());
-                Ok(())
-            },
-            _ => Err(anyhow::anyhow!("Invalid response from seed node"))
-        }
-    }
-
-    async fn distribute_build(&self, workspace_path: PathBuf, release: bool) -> Result<()> {
-        // Retrieve project metadata
-        let metadata = MetadataCommand::new()
-            .current_dir(&workspace_path)
-            .exec()?;
-
-        // Create dependency graph
-        let mut graph = Graph::<BuildUnit, (), Directed>::new();
-        let mut pkg_to_node = HashMap::new();
-
-        // Build graph of build units
-        for package in &metadata.packages {
-            let source_files: Vec<PathBuf> = package.targets.iter()
-                .filter(|t| t.kind.iter().any(|k| k == "lib" || k == "bin"))
-                .flat_map(|t| {
-                    WalkDir::new(t.src_path.parent().unwrap())
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
-                        .map(|e| e.path().to_path_buf())
-                })
-                .collect();
-
-            let unit = BuildUnit {
-                package_name: package.name.clone(),
-                dependencies: package.dependencies.iter()
-                    .map(|d| d.name.clone())
-                    .collect(),
-                source_files,
-                artifacts: package.targets.iter()
-                    .map(|t: &cargo_metadata::Target| PathBuf::from(&t.name))
-                    .collect(),
-            };
-
-            let idx = graph.add_node(unit);
-            pkg_to_node.insert(package.name.clone(), idx);
-        }
-
-        // Add dependency edges
-        for package in &metadata.packages {
-            let from = pkg_to_node[&package.name];
-            for dep in &package.dependencies {
-                if let Some(&to) = pkg_to_node.get(&dep.name) {
-                    graph.add_edge(from, to, ());
-                }
-            }
-        }
-
-        // Determine build order
-        let build_order = petgraph::algo::toposort(&graph, None)
-            .map_err(|_| anyhow::anyhow!("Cyclic dependencies detected"))?;
-
-        // Prepare build futures
-        let mut futures = Vec::new();
-        let nodes = self.nodes.read().await;
-        let mut node_iter = nodes.keys().cycle();
-
-        // Schedule builds across nodes
-        for unit_idx in build_order {
-            let unit = graph[unit_idx].clone();
-            if let Some(node) = node_iter.next() {
-                let node = node.clone();
-                let self_ref = self.clone();
-                let build_future = async move {
-                    self_ref.build_on_node(&node, unit, release).await
-                };
-                futures.push(build_future);
-            }
-        }
-
-        // Execute builds and process results
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(BuildResponse::BuildComplete { unit_name, artifacts }) => {
-                    info!(unit = %unit_name, "Build complete");
-                    let mut cache = self.build_cache.write().await;
-                    for (path, data) in artifacts {
-                        cache.insert(format!("{}:{}", unit_name, path.display()), data);
-                    }
-                }
-                Ok(BuildResponse::BuildError { unit_name, error }) => {
-                    error!(unit = %unit_name, "Build failed: {}", error);
-                    return Err(anyhow::anyhow!("Build failed for {}: {}", unit_name, error));
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
     }
 }
