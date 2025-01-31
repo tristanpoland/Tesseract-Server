@@ -91,20 +91,20 @@ enum BuildResponse {
     HeartbeatAck
 }
 
-struct BuildCluster {
-    config: Arc<BuildConfig>,
-    local_node: Node,
-    nodes: Arc<RwLock<HashMap<Node, time::Instant>>>,
-    build_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    build_dir: PathBuf,
-}
-
 #[derive(Clone)]
 struct BuildConfig {
     port: u16,
     seed: Option<String>,
     max_jobs: usize,
     timeout: Duration,
+}
+
+struct BuildCluster {
+    config: Arc<BuildConfig>,
+    local_node: Node,
+    nodes: Arc<RwLock<HashMap<Node, time::Instant>>>,
+    build_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    build_dir: PathBuf,
 }
 
 impl BuildCluster {
@@ -123,6 +123,18 @@ impl BuildCluster {
             build_cache: Arc::new(RwLock::new(HashMap::new())),
             build_dir,
         }
+    }
+
+    async fn send_build_response(
+        stream: &mut TcpStream,
+        response: BuildResponse,
+    ) -> Result<()> {
+        let response_data = bincode::serialize(&response)?;
+        let len = (response_data.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&response_data).await?;
+        stream.flush().await?;
+        Ok(())
     }
 
     async fn ensure_target_installed(target: &str) -> Result<()> {
@@ -155,25 +167,6 @@ impl BuildCluster {
         Ok(())
     }
 
-    async fn stream_output(
-        stream: &mut TcpStream,
-        unit_name: &str,
-        output: String,
-        is_error: bool,
-    ) -> Result<()> {
-        let response = BuildResponse::BuildOutput {
-            unit_name: unit_name.to_string(),
-            output,
-            is_error,
-        };
-        
-        let data = bincode::serialize(&response)?;
-        let len = (data.len() as u32).to_be_bytes();
-        stream.write_all(&len).await?;
-        stream.write_all(&data).await?;
-        Ok(())
-    }
-
     #[instrument(skip(self))]
     async fn build_locally_with_tarball(
         &self,
@@ -183,30 +176,36 @@ impl BuildCluster {
         target: Option<String>,
         tarball_data: Vec<u8>
     ) -> Result<BuildResponse> {
+        let package_name = unit.package_name.clone();
+        
+        // Install target if needed
         if let Some(target_triple) = &target {
             if let Err(e) = Self::ensure_target_installed(target_triple).await {
                 return Ok(BuildResponse::BuildError {
-                    unit_name: unit.package_name.clone(),
+                    unit_name: package_name,
                     error: format!("Failed to install target {}: {}", target_triple, e),
                 });
             }
         }
 
-        let package_dir = self.build_dir.join(format!("{}_{}", unit.package_name, std::process::id()));
+        // Setup build directory
+        let package_dir = self.build_dir.join(format!("{}_{}", package_name, std::process::id()));
         let _ = tokio::fs::remove_dir_all(&package_dir).await;
         tokio::fs::create_dir_all(&package_dir).await?;
 
+        info!(dir = %package_dir.display(), "Extracting source tarball");
         Self::extract_tarball(&tarball_data, &package_dir)
             .context("Failed to extract source tarball")?;
 
         let cargo_toml_path = package_dir.join("Cargo.toml");
         if !cargo_toml_path.exists() {
             return Ok(BuildResponse::BuildError {
-                unit_name: unit.package_name,
+                unit_name: package_name,
                 error: "Cargo.toml not found in extracted tarball".to_string(),
             });
         }
 
+        // Setup build command
         let mut cmd = TokioCommand::new("cargo");
         cmd.current_dir(&package_dir)
             .arg("build")
@@ -216,6 +215,7 @@ impl BuildCluster {
             cmd.args(["--target", target_triple]);
         }
 
+        // Execute build with output streaming
         let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -228,58 +228,155 @@ impl BuildCluster {
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
         
-        let package_name = unit.package_name.clone();
-        
-        // Stream stdout and stderr while building
+        let mut build_output = Vec::new();
+        let mut build_failed = false;
+
+        // Stream output
         loop {
             tokio::select! {
                 Ok(Some(line)) = stdout_reader.next_line() => {
-                    Self::stream_output(stream, &package_name, line, false).await?;
+                    if !line.trim().is_empty() {
+                        info!(unit_name = %package_name, "cargo stdout: {}", line);
+                        Self::send_build_response(
+                            stream,
+                            BuildResponse::BuildOutput {
+                                unit_name: package_name.clone(),
+                                output: line.clone(),
+                                is_error: false,
+                            }
+                        ).await?;
+                        build_output.push(line);
+                    }
                 }
                 Ok(Some(line)) = stderr_reader.next_line() => {
-                    Self::stream_output(stream, &package_name, line, true).await?;
+                    if !line.trim().is_empty() {
+                        warn!(unit_name = %package_name, "cargo stderr: {}", line);
+                        Self::send_build_response(
+                            stream,
+                            BuildResponse::BuildOutput {
+                                unit_name: package_name.clone(),
+                                output: line.clone(),
+                                is_error: true,
+                            }
+                        ).await?;
+                        build_output.push(line);
+                    }
                 }
-                status = child.wait() => {
-                    if let Ok(status) = status {
-                        if !status.success() {
+                result = child.wait() => {
+                    match result {
+                        Ok(status) => {
+                            if !status.success() {
+                                build_failed = true;
+                            }
+                            break;
+                        }
+                        Err(e) => {
                             return Ok(BuildResponse::BuildError {
                                 unit_name: package_name,
-                                error: "Build failed".to_string(),
+                                error: format!("Build process error: {}", e),
                             });
                         }
-                        break;
                     }
                 }
             }
         }
 
-        let mut artifacts = Vec::new();
-        let mut target_dir = package_dir.join("target");
-        if let Some(target_triple) = &target {
-            target_dir = target_dir.join(target_triple);
+        if build_failed {
+            let error_msg = build_output.join("\n");
+            return Ok(BuildResponse::BuildError {
+                unit_name: package_name,
+                error: error_msg,
+            });
         }
-        target_dir = target_dir.join(if release { "release" } else { "debug" });
-        
-        for artifact_path in &unit.artifacts {
-            match tokio::fs::read(target_dir.join(artifact_path)).await {
-                Ok(data) => {
-                    artifacts.push((artifact_path.clone(), data));
+
+        // Collect artifacts
+        let mut artifacts = Vec::new();
+        let target_dir = package_dir.join("target");
+
+        // Function to check multiple possible paths
+        let check_artifact_paths = |base_name: &Path| -> Vec<PathBuf> {
+            let mut paths = Vec::new();
+            
+            let file_name = base_name.file_name().unwrap().to_str().unwrap();
+            
+            // Release or debug directory path
+            let mut binary_dir = if let Some(target_triple) = &target {
+                target_dir.join(target_triple)
+            } else {
+                target_dir.clone()
+            };
+            binary_dir = binary_dir.join(if release { "release" } else { "debug" });
+
+            // Check with and without .exe extension
+            paths.push(binary_dir.join(file_name));
+            paths.push(binary_dir.join(format!("{}.exe", file_name)));
+            
+            paths
+        };
+
+        info!("Looking for artifacts in: {}", target_dir.display());
+
+        for artifact_name in &unit.artifacts {
+            let mut found = false;
+            let possible_paths = check_artifact_paths(artifact_name);
+            
+            for path in &possible_paths {
+                info!("Checking path: {}", path.display());
+                match tokio::fs::read(&path).await {
+                    Ok(data) => {
+                        info!(
+                            "Found artifact at {}, size: {} bytes",
+                            path.display(),
+                            data.len()
+                        );
+                        artifacts.push((artifact_name.clone(), data));
+                        found = true;
+                        break;
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Artifact not found at {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    return Ok(BuildResponse::BuildError {
-                        unit_name: unit.package_name,
-                        error: format!("Failed to read artifact {}: {}", artifact_path.display(), e),
-                    });
-                }
+            }
+
+            if !found {
+                let paths_tried = possible_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                    
+                return Ok(BuildResponse::BuildError {
+                    unit_name: package_name,
+                    error: format!(
+                        "Could not find artifact '{}'. Tried paths: {}",
+                        artifact_name.display(),
+                        paths_tried
+                    ),
+                });
             }
         }
 
+        // Clean up
+        let cleanup_dir = package_dir.clone();
         tokio::spawn(async move {
-            let _ = tokio::fs::remove_dir_all(&package_dir).await;
+            if let Err(e) = tokio::fs::remove_dir_all(&cleanup_dir).await {
+                warn!(dir = %cleanup_dir.display(), error = %e, "Failed to clean up build directory");
+            }
         });
 
+        info!(
+            unit_name = %package_name,
+            artifact_count = %artifacts.len(),
+            "Build and artifact collection complete"
+        );
+
         Ok(BuildResponse::BuildComplete {
-            unit_name: unit.package_name,
+            unit_name: package_name,
             artifacts,
         })
     }
@@ -352,6 +449,7 @@ impl BuildCluster {
 }
 
 async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) -> Result<()> {
+    let peer_addr = socket.peer_addr()?;
     socket.set_nodelay(true)?;
     
     loop {
@@ -360,9 +458,9 @@ async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) ->
             Ok(_) => (),
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    info!("Client disconnected");
+                    info!(peer = %peer_addr, "Client disconnected");
                 } else {
-                    error!("Error reading message length: {}", e);
+                    error!(peer = %peer_addr, error = %e, "Error reading message length");
                 }
                 return Ok(());
             }
@@ -370,23 +468,25 @@ async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) ->
         
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > 100_000_000 { // 100MB limit
-            error!("Request too large: {}", len);
+            error!(peer = %peer_addr, length = len, "Request too large");
             return Ok(());
         }
         
         let mut buf = vec![0; len];
         if let Err(e) = socket.read_exact(&mut buf).await {
-            error!("Error reading request data: {}", e);
+            error!(peer = %peer_addr, error = %e, "Error reading request data");
             return Ok(());
         }
         
         let request: BuildRequest = match bincode::deserialize(&buf) {
             Ok(req) => req,
             Err(e) => {
-                error!("Deserialization error: {}", e);
+                error!(peer = %peer_addr, error = %e, "Deserialization error");
                 continue;
             }
         };
+
+        debug!(peer = %peer_addr, ?request, "Received request");
 
         let response = match cluster.handle_request(&mut socket, request).await {
             Ok(resp) => resp,
@@ -398,14 +498,17 @@ async fn handle_connection(mut socket: TcpStream, cluster: Arc<BuildCluster>) ->
 
         let response_data = bincode::serialize(&response)?;
         let len = (response_data.len() as u32).to_be_bytes();
-        if let Err(e) = socket.write_all(&len).await {
-            error!("Error sending response length: {}", e);
+
+        let mut combined = Vec::with_capacity(4 + response_data.len());
+        combined.extend_from_slice(&len);
+        combined.extend_from_slice(&response_data);
+
+        if let Err(e) = socket.write_all(&combined).await {
+            error!(peer = %peer_addr, error = %e, "Error sending response");
             return Ok(());
         }
-        if let Err(e) = socket.write_all(&response_data).await {
-            error!("Error sending response data: {}", e);
-            return Ok(());
-        }
+
+        socket.flush().await?;
     }
 }
 
