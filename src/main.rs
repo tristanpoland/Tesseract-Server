@@ -109,6 +109,47 @@ struct BuildConfig {
     timeout: Duration,
 }
 
+fn get_possible_artifact_paths(target_dir: &Path, base_name: &Path, target_triple: Option<&str>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let base_path = target_dir.join(base_name);
+    
+    // Start with the base name
+    paths.push(base_path.clone());
+
+    // Check if target indicates Windows
+    let is_windows = target_triple
+        .map(|t| t.contains("windows"))
+        .unwrap_or(cfg!(windows));
+
+    // Add Windows extension if appropriate
+    if is_windows {
+        paths.push(base_path.with_extension("exe"));
+    }
+
+    // Add Unix executable (no extension) if appropriate
+    if !is_windows {
+        paths.push(base_path.clone());
+    }
+
+    // Add dynamic library extensions
+    match target_triple.map(|t| t.split('-').next().unwrap_or("")) {
+        Some("windows") | Some("pc-windows") => {
+            paths.push(base_path.with_extension("dll"));
+        }
+        Some("apple") | Some("ios") | Some("darwin") => {
+            paths.push(base_path.with_extension("dylib"));
+        }
+        _ => {
+            paths.push(base_path.with_extension("so"));
+        }
+    }
+
+    // Always check for rlib (static library)
+    paths.push(base_path.with_extension("rlib"));
+
+    paths
+}
+
 impl BuildCluster {
     fn new(config: Arc<BuildConfig>, build_dir: PathBuf) -> Self {
         let cores = num_cpus::get();
@@ -306,23 +347,37 @@ impl BuildCluster {
         }
         target_dir = target_dir.join(if release { "release" } else { "debug" });
         
-        for artifact_path in &unit.artifacts {
-            let file_path = target_dir.join(artifact_path);
-            match tokio::fs::read(&file_path).await {
-                Ok(data) => {
-                    artifacts.push((artifact_path.clone(), data));
+        for base_artifact_path in &unit.artifacts {
+            // Try multiple possible extensions based on target
+            let possible_paths = get_possible_artifact_paths(&target_dir, base_artifact_path, target.as_deref());
+            
+            let mut found = false;
+            for file_path in possible_paths {
+                match tokio::fs::read(&file_path).await {
+                    Ok(data) => {
+                        // Use the actual filename as the artifact path
+                        let final_name = file_path.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| PathBuf::from(n))
+                            .unwrap_or_else(|| base_artifact_path.clone());
+                        artifacts.push((final_name, data));
+                        found = true;
+                        break;
+                    }
+                    Err(_) => continue,
                 }
-                Err(e) => {
-                    error!(
-                        unit_name = %unit.package_name,
-                        artifact = %file_path.display(),
-                        "Failed to read artifact: {}", e
-                    );
-                    return Ok(BuildResponse::BuildError {
-                        unit_name: unit.package_name,
-                        error: format!("Failed to read artifact {}: {}", file_path.display(), e),
-                    });
-                }
+            }
+            
+            if !found {
+                error!(
+                    unit_name = %unit.package_name,
+                    artifact = %base_artifact_path.display(),
+                    "Failed to find artifact in any platform-specific form"
+                );
+                return Ok(BuildResponse::BuildError {
+                    unit_name: unit.package_name,
+                    error: format!("Failed to find artifact {} in target directory", base_artifact_path.display()),
+                });
             }
         }
     
