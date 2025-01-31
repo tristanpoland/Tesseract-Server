@@ -17,11 +17,7 @@ use std::{
 };
 use tar::Archive;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt}, 
-    net::{TcpListener, TcpStream}, 
-    sync::{mpsc, RwLock}, 
-    time,
-    process::Command as TokioCommand,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, process::Command as TokioCommand, sync::{mpsc, RwLock}, time
 };
 use tracing::{error, info, warn, debug, instrument, Level};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -283,8 +279,16 @@ impl BuildCluster {
         target: Option<String>,
         tarball_data: Vec<u8>
     ) -> Result<BuildResponse> {
+        info!(
+            unit_name = %unit.package_name,
+            release = %release,
+            target = ?target,
+            "Starting build"
+        );
+    
         // Install target if specified
         if let Some(target_triple) = &target {
+            info!(target = %target_triple, "Ensuring target is installed");
             if let Err(e) = Self::ensure_target_installed(target_triple).await {
                 return Ok(BuildResponse::BuildError {
                     unit_name: unit.package_name.clone(),
@@ -292,17 +296,23 @@ impl BuildCluster {
                 });
             }
         }
-
+    
         let package_dir = self.build_dir.join(format!("{}_{}", unit.package_name, std::process::id()));
         
         // Clean up previous builds
-        let _ = tokio::fs::remove_dir_all(&package_dir).await;
+        if package_dir.exists() {
+            info!(dir = %package_dir.display(), "Cleaning previous build directory");
+            let _ = tokio::fs::remove_dir_all(&package_dir).await;
+        }
+        
+        info!(dir = %package_dir.display(), "Creating build directory");
         tokio::fs::create_dir_all(&package_dir).await?;
-
+    
         // Extract tarball 
+        info!(unit_name = %unit.package_name, "Extracting source tarball");
         Self::extract_tarball(&tarball_data, &package_dir)
             .context("Failed to extract source tarball")?;
-
+    
         // Validate Cargo.toml
         let cargo_toml_path = package_dir.join("Cargo.toml");
         if !cargo_toml_path.exists() {
@@ -311,33 +321,88 @@ impl BuildCluster {
                 error: "Cargo.toml not found in extracted tarball".to_string(),
             });
         }
-
+    
         // Prepare build command
         let mut cmd = TokioCommand::new("cargo");
         cmd.current_dir(&package_dir)
             .arg("build")
             .args(if release { vec!["--release"] } else { vec![] });
-
+    
         // Add target if specified
         if let Some(target_triple) = &target {
             cmd.args(["--target", target_triple]);
         }
-
-        // Execute build
-        let output = cmd
-            .output()
-            .await
+    
+        info!(
+            unit_name = %unit.package_name,
+            release = %release,
+            target = ?target,
+            "Starting cargo build"
+        );
+    
+        // Execute build with live output streaming
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .context("Failed to execute cargo build")?;
     
+        let stdout = child.stdout.take().expect("Failed to capture stdout");
+        let stderr = child.stderr.take().expect("Failed to capture stderr");
+        
+        // Stream stdout and stderr in separate tasks
+        let stdout_handle = tokio::spawn({
+            let package_name = unit.package_name.clone();
+            async move {
+                let mut reader = tokio::io::BufReader::new(stdout);
+                let mut line = String::new();
+                let mut output = Vec::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 { break; }
+                    info!(unit_name = %package_name, "cargo stdout: {}", line.trim());
+                    output.push(line.clone());
+                    line.clear();
+                }
+                output.join("")
+            }
+        });
+    
+        let stderr_handle = tokio::spawn({
+            let package_name = unit.package_name.clone();
+            async move {
+                let mut reader = tokio::io::BufReader::new(stderr);
+                let mut line = String::new();
+                let mut output = Vec::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 { break; }
+                    warn!(unit_name = %package_name, "cargo stderr: {}", line.trim());
+                    output.push(line.clone());
+                    line.clear();
+                }
+                output.join("")
+            }
+        });
+    
+        // Wait for build to complete and collect output
+        let status = child.wait().await?;
+        let stdout_output = stdout_handle.await.unwrap_or_default();
+        let stderr_output = stderr_handle.await.unwrap_or_default();
+        
         // Check build result
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).to_string();
+        if !status.success() {
+            let error_msg = if stderr_output.is_empty() {
+                stdout_output
+            } else {
+                stderr_output
+            };
             error!(unit_name = %unit.package_name, "Build failed: {}", error_msg);
             return Ok(BuildResponse::BuildError {
                 unit_name: unit.package_name,
                 error: error_msg,
             });
         }
+    
+        info!(unit_name = %unit.package_name, "Build completed successfully");
     
         // Collect artifacts
         let mut artifacts = Vec::new();
@@ -347,14 +412,26 @@ impl BuildCluster {
         }
         target_dir = target_dir.join(if release { "release" } else { "debug" });
         
+        info!(
+            unit_name = %unit.package_name,
+            target_dir = %target_dir.display(),
+            "Collecting artifacts"
+        );
+    
         for base_artifact_path in &unit.artifacts {
             // Try multiple possible extensions based on target
             let possible_paths = get_possible_artifact_paths(&target_dir, base_artifact_path, target.as_deref());
             
             let mut found = false;
-            for file_path in possible_paths {
+            for file_path in &possible_paths {
                 match tokio::fs::read(&file_path).await {
                     Ok(data) => {
+                        info!(
+                            unit_name = %unit.package_name,
+                            artifact = %file_path.display(),
+                            size = %data.len(),
+                            "Artifact collected"
+                        );
                         // Use the actual filename as the artifact path
                         let final_name = file_path.file_name()
                             .and_then(|n| n.to_str())
@@ -369,22 +446,38 @@ impl BuildCluster {
             }
             
             if !found {
+                let paths_tried = possible_paths.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                
                 error!(
                     unit_name = %unit.package_name,
                     artifact = %base_artifact_path.display(),
+                    tried_paths = %paths_tried,
                     "Failed to find artifact in any platform-specific form"
                 );
                 return Ok(BuildResponse::BuildError {
                     unit_name: unit.package_name,
-                    error: format!("Failed to find artifact {} in target directory", base_artifact_path.display()),
+                    error: format!("Failed to find artifact {}. Tried paths: {}", base_artifact_path.display(), paths_tried),
                 });
             }
         }
     
-        // Background cleanup
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_dir_all(&package_dir).await;
-        });
+        // // Background cleanup
+        // let cleanup_dir = package_dir.clone();
+        // tokio::spawn(async move {
+        //     info!(dir = %cleanup_dir.display(), "Cleaning up build directory");
+        //     if let Err(e) = tokio::fs::remove_dir_all(&cleanup_dir).await {
+        //         warn!(dir = %cleanup_dir.display(), error = %e, "Failed to clean up build directory");
+        //     }
+        // });
+    
+        info!(
+            unit_name = %unit.package_name,
+            artifact_count = %artifacts.len(),
+            "Build and artifact collection complete"
+        );
     
         Ok(BuildResponse::BuildComplete {
             unit_name: unit.package_name,
