@@ -163,7 +163,16 @@ impl BuildCluster {
         std::fs::create_dir_all(dest_path)?;
         let decoder = GzDecoder::new(tarball_data);
         let mut archive = Archive::new(decoder);
+
+        // First, extract all files
         archive.unpack(dest_path)?;
+
+        // Verify the expected files exist
+        let workspace_toml = dest_path.join("Cargo.toml");
+        if !workspace_toml.exists() {
+            return Err(anyhow::anyhow!("Workspace Cargo.toml not found after extraction"));
+        }
+
         Ok(())
     }
 
